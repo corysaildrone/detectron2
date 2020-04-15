@@ -2,6 +2,7 @@
 import math
 import sys
 import torch
+from apex.amp import float_function
 from torch import nn
 from torchvision.ops import RoIPool
 
@@ -169,14 +170,11 @@ class ROIPooler(nn.Module):
             len(scales) == self.max_level - self.min_level + 1
         ), "[ROIPooler] Sizes of input featuremaps do not form a pyramid!"
         assert 0 < self.min_level and self.min_level <= self.max_level
-        if len(scales) > 1:
-            # When there is only one feature map, canonical_level is redundant and we should not
-            # require it to be a sensible value. Therefore we skip this assertion
-            assert self.min_level <= canonical_level and canonical_level <= self.max_level
         self.canonical_level = canonical_level
         assert canonical_box_size > 0
         self.canonical_box_size = canonical_box_size
 
+    @float_function
     def forward(self, x, box_lists):
         """
         Args:
@@ -228,7 +226,7 @@ class ROIPooler(nn.Module):
         )
 
         for level, (x_level, pooler) in enumerate(zip(x, self.level_poolers)):
-            inds = torch.nonzero(level_assignments == level).squeeze(1)
+            inds = torch.nonzero(level_assignments == level, as_tuple=True)[0]
             pooler_fmt_boxes_level = pooler_fmt_boxes[inds]
             output[inds] = pooler(x_level, pooler_fmt_boxes_level)
 

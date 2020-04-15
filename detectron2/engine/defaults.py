@@ -12,6 +12,10 @@ since they are meant to represent the "common default behavior" people need in t
 import argparse
 import logging
 import os
+
+import time
+import sys
+
 from collections import OrderedDict
 import torch
 from fvcore.common.file_io import PathManager
@@ -42,6 +46,13 @@ from detectron2.utils.logger import setup_logger
 from . import hooks
 from .train_loop import SimpleTrainer
 
+try:
+    from apex import amp
+except ImportError:
+    raise ImportError(
+        "Please install apex from https://www.github.com/nvidia/apex to run this example."
+    )
+
 __all__ = ["default_argument_parser", "default_setup", "DefaultPredictor", "DefaultTrainer"]
 
 
@@ -52,7 +63,19 @@ def default_argument_parser():
     Returns:
         argparse.ArgumentParser:
     """
-    parser = argparse.ArgumentParser(description="Detectron2 Training")
+    parser = argparse.ArgumentParser(
+        epilog=f"""
+Examples:
+
+Run on single machine:
+    $ {sys.argv[0]} --num-gpus 8 --config-file cfg.yaml MODEL.WEIGHTS /path/to/weight.pth
+
+Run on multiple machines:
+    (machine0)$ {sys.argv[0]} --machine-rank 0 --num-machines 2 --dist-url <URL> [--other-flags]
+    (machine1)$ {sys.argv[0]} --machine-rank 1 --num-machines 2 --dist-url <URL> [--other-flags]
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
     parser.add_argument(
         "--resume",
@@ -61,7 +84,7 @@ def default_argument_parser():
     )
     parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
     parser.add_argument("--num-gpus", type=int, default=1, help="number of gpus *per machine*")
-    parser.add_argument("--num-machines", type=int, default=1)
+    parser.add_argument("--num-machines", type=int, default=1, help="total number of machines")
     parser.add_argument(
         "--machine-rank", type=int, default=0, help="the rank of this machine (unique per machine)"
     )
@@ -69,8 +92,13 @@ def default_argument_parser():
     # PyTorch still may leave orphan processes in multi-gpu training.
     # Therefore we use a deterministic way to obtain port,
     # so that users are aware of orphan processes by seeing the port occupied.
-    port = 2 ** 15 + 2 ** 14 + hash(os.getuid()) % 2 ** 14
-    parser.add_argument("--dist-url", default="tcp://127.0.0.1:{}".format(port))
+    port = 2 ** 15 + 2 ** 14 + hash(os.getuid() if sys.platform != "win32" else 1) % 2 ** 14
+    parser.add_argument(
+        "--dist-url",
+        default="tcp://127.0.0.1:{}".format(port),
+        help="initialization URL for pytorch distributed backend. See "
+        "https://pytorch.org/docs/stable/distributed.html for details.",
+    )
     parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
@@ -118,7 +146,7 @@ def default_setup(cfg, args):
         path = os.path.join(output_dir, "config.yaml")
         with PathManager.open(path, "w") as f:
             f.write(cfg.dump())
-        logger.info("Full config saved to {}".format(os.path.abspath(path)))
+        logger.info("Full config saved to {}".format(path))
 
     # make sure each worker has a different, yet deterministic seed if specified
     seed_all_rng(None if cfg.SEED < 0 else cfg.SEED + rank)
@@ -203,7 +231,8 @@ class DefaultTrainer(SimpleTrainer):
     contains the following logic in addition:
 
     1. Create model, optimizer, scheduler, dataloader from the given config.
-    2. Load a checkpoint or `cfg.MODEL.WEIGHTS`, if exists.
+    2. Load a checkpoint or `cfg.MODEL.WEIGHTS`, if exists, when
+       `resume_or_load` is called.
     3. Register a few common hooks.
 
     It is created to simplify the **standard model training workflow** and reduce code boilerplate
@@ -225,11 +254,6 @@ class DefaultTrainer(SimpleTrainer):
     It is only guaranteed to work well with the standard models and training workflow in detectron2.
     To obtain more stable behavior, write your own training logic with other public APIs.
 
-    Attributes:
-        scheduler:
-        checkpointer (DetectionCheckpointer):
-        cfg (CfgNode):
-
     Examples:
 
     .. code-block:: python
@@ -237,6 +261,11 @@ class DefaultTrainer(SimpleTrainer):
         trainer = DefaultTrainer(cfg)
         trainer.resume_or_load()  # load last checkpoint or MODEL.WEIGHTS
         trainer.train()
+
+    Attributes:
+        scheduler:
+        checkpointer (DetectionCheckpointer):
+        cfg (CfgNode):
     """
 
     def __init__(self, cfg):
@@ -254,6 +283,10 @@ class DefaultTrainer(SimpleTrainer):
 
         # For training, wrap with DDP. But don't need this for inference.
         if comm.get_world_size() > 1:
+            if cfg.MODEL.APEX_ON is True:
+                model, optimizer = amp.initialize(
+                    model, optimizer, opt_level=cfg.MODEL.APEX_OPT_LEVEL
+                )
             model = DistributedDataParallel(
                 model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
             )
@@ -275,23 +308,61 @@ class DefaultTrainer(SimpleTrainer):
 
         self.register_hooks(self.build_hooks())
 
+    def run_step(self):
+        """
+        Implement the standard training logic described above.
+        """
+        assert self.model.training, "[DefaultTrainer] model was changed to eval mode!"
+        start = time.perf_counter()
+        """
+        If your want to do something with the data, you can wrap the dataloader.
+        """
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
+
+        """
+        If your want to do something with the losses, you can wrap the model.
+        """
+        loss_dict = self.model(data)
+        losses = sum(loss for loss in loss_dict.values())
+        self._detect_anomaly(losses, loss_dict)
+
+        metrics_dict = loss_dict
+        metrics_dict["data_time"] = data_time
+        self._write_metrics(metrics_dict)
+
+        """
+        If you need accumulate gradients or something similar, you can
+        wrap the optimizer with your custom `zero_grad()` method.
+        """
+        self.optimizer.zero_grad()
+        if self.cfg.MODEL.APEX_ON is True:
+            with amp.scale_loss(losses, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            losses.backward()
+
+        """
+        If you need gradient clipping/scaling or other processing, you can
+        wrap the optimizer with your custom `step()` method.
+        """
+        self.optimizer.step()
+
     def resume_or_load(self, resume=True):
         """
-        If `resume==True`, and last checkpoint exists, resume from it.
+        If `resume==True`, and last checkpoint exists, resume from it and load all
+        checkpointables (eg. optimizer and scheduler).
 
-        Otherwise, load a model specified by the config.
+        Otherwise, load the model specified by the config (skip all checkpointables).
 
         Args:
             resume (bool): whether to do resume or not
         """
+        checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
+        self.start_iter = checkpoint.get("iteration", -1) if resume else -1
         # The checkpoint stores the training iteration that just finished, thus we start
         # at the next iteration (or iter zero if there's no checkpoint).
-        self.start_iter = (
-            self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume).get(
-                "iteration", -1
-            )
-            + 1
-        )
+        self.start_iter += 1
 
     def build_hooks(self):
         """
