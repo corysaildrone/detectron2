@@ -2,6 +2,7 @@
 import math
 import sys
 import torch
+from apex.amp import float_function
 from torch import nn
 from torchvision.ops import RoIPool
 
@@ -173,6 +174,7 @@ class ROIPooler(nn.Module):
         assert canonical_box_size > 0
         self.canonical_box_size = canonical_box_size
 
+    @float_function
     def forward(self, x, box_lists):
         """
         Args:

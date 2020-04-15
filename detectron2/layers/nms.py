@@ -2,10 +2,12 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import torch
+from apex.amp import float_function
 from torchvision.ops import boxes as box_ops
 from torchvision.ops import nms  # BC-compat
 
 
+@float_function
 def batched_nms(boxes, scores, idxs, iou_threshold):
     """
     Same as torchvision.ops.boxes.batched_nms, but safer.
